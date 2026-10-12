@@ -67,8 +67,7 @@ def growth(db, kind, min_hours=6):
 
 
 def growth_section(db, kind, top):
-    has_pages = db.execute("SELECT 1 FROM sqlite_master WHERE name='pages'").fetchone()
-    rows = growth(db, kind) if has_pages else []
+    rows = growth(db, kind)
     name = "hashtags" if kind == "tag" else "sounds"
     if not rows:
         print(f"\nNo {name} tracked yet (run the scraper with --track).")

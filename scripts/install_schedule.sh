@@ -1,10 +1,11 @@
 #!/bin/bash
-# Installs a macOS scheduled job that runs the scraper at 11:00 and 23:00 every day.
+# Installs two macOS scheduled jobs:
+#   11:00  Explore categories   (com.tiktokanalyser.explore)
+#   23:00  hashtag/sound pages  (com.tiktokanalyser.track)
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LABEL="com.tiktokanalyser.scrape"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/tiktokanalyser.log"
+UID_="$(id -u)"
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 if [ ! -x "$DIR/.venv/bin/python" ]; then
@@ -12,29 +13,39 @@ if [ ! -x "$DIR/.venv/bin/python" ]; then
 fi
 chmod +x "$DIR/scripts/run_scheduled.sh"
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-cat > "$PLIST" <<PLIST
+
+# Remove the old single combined job if it's there.
+launchctl bootout "gui/$UID_/com.tiktokanalyser.scrape" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.tiktokanalyser.scrape.plist"
+
+install_job() {  # label mode hour
+  local label="$1" mode="$2" hour="$3"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>$LABEL</string>
+  <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>$(xml "$DIR/scripts/run_scheduled.sh")</string>
+    <string>$mode</string>
   </array>
   <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer></dict>
-  </array>
+  <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>0</integer></dict>
   <key>StandardOutPath</key><string>$(xml "$LOG")</string>
   <key>StandardErrorPath</key><string>$(xml "$LOG")</string>
 </dict>
 </plist>
 PLIST
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "Scheduled: runs daily at 11:00 and 23:00."
-echo "Run it now to test:  launchctl kickstart gui/$(id -u)/$LABEL"
-echo "Watch the log:       tail -f \"$LOG\""
+  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_" "$plist"
+}
+
+install_job com.tiktokanalyser.explore explore 11
+install_job com.tiktokanalyser.track track 23
+echo "Scheduled: Explore at 11:00, hashtag/sound tracking at 23:00."
+echo "Test now:  launchctl kickstart gui/$UID_/com.tiktokanalyser.track"
+echo "Log:       tail -f \"$LOG\""

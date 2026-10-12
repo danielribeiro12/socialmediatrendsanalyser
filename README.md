@@ -35,7 +35,13 @@ totals between runs shows what's spreading. Pages checked each run:
   creators in the last 3 days of Explore data;
 - anything first tracked in the last 7 days, so it keeps a continuous history.
 
-## Scheduled runs (11:00 and 23:00 daily)
+## Scheduled runs
+
+- 11:00: every Explore category
+- 23:00: hashtag and sound pages
+
+They're split so TikTok never sees one long burst of page loads, and both use
+longer pauses (`--slow`).
 
     bash scripts/install_schedule.sh       # install
     bash scripts/uninstall_schedule.sh     # remove

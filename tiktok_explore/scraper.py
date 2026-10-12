@@ -32,6 +32,15 @@ CATEGORY_SELECTOR = ("[class*='CategoryList'] button, [class*='CategoryItem'], "
                      "[data-e2e*='category'] button, [role='tab']")
 
 
+# Pauses between pages (seconds). --slow raises them for scheduled runs.
+PAUSES = {"explore": (2, 5), "page": (5, 10)}
+SLOW_PAUSES = {"explore": (10, 20), "page": (15, 30)}
+
+
+def pause(kind):
+    time.sleep(random.uniform(*PAUSES[kind]))
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -330,7 +339,7 @@ def scrape_explore(b, categories, max_items, records, errors):
         except Exception as exc:
             errors.append({"category": category, "scraped_at": now(),
                            "errorCode": "SCRAPE_FAILED", "error": repr(exc)[:300]})
-        time.sleep(random.uniform(2, 5))
+        pause("explore")
 
 
 # ---------------------------------------------------------------- hashtag / sound pages
@@ -361,7 +370,7 @@ def scrape_page(b, kind, key, max_items, records, errors, pages):
     except Exception as exc:
         errors.append({"category": label, "scraped_at": now(), "errorCode": "SCRAPE_FAILED",
                        "error": repr(exc)[:300]})
-    time.sleep(random.uniform(5, 10))
+    pause("page")
 
 
 # ---------------------------------------------------------------- run
@@ -410,6 +419,8 @@ def main():
     ap.add_argument("--show", action="store_true", help="Show the browser window")
     ap.add_argument("--fallback-show", action="store_true",
                     help="If a hidden-browser run gets nothing, retry with the window shown")
+    ap.add_argument("--slow", action="store_true",
+                    help="Longer pauses between pages (used by the scheduled runs)")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--watchlist", default="watchlist.txt")
     args = ap.parse_args()
@@ -419,6 +430,8 @@ def main():
     else:
         categories = ALL_CATEGORIES if args.all else (args.categories or ["All"])
     track = args.track or args.track_only
+    if args.slow:
+        PAUSES.update(SLOW_PAUSES)
 
     def run(show):
         if show:
