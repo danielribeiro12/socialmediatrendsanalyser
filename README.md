@@ -31,7 +31,7 @@ sounds and records the total number of videos shown there. Comparing those
 totals between runs shows what's spreading. Pages checked each run:
 
 - every hashtag in `watchlist.txt` (edit it freely);
-- the 20 non-generic hashtags and 40 sounds used by the most different
+- the 10 non-generic hashtags and 20 sounds used by the most different
   creators in the last 3 days of Explore data;
 - anything first tracked in the last 7 days, so it keeps a continuous history.
 
@@ -53,3 +53,10 @@ Failures are saved as error entries (`CATEGORY_NOT_FOUND`, `EXPLORE_EMPTY`,
 `PAGE_EMPTY`, `SCRAPE_FAILED`) instead of being skipped.
 
 Keep it gentle: logged out, a couple of runs a day.
+
+## CAPTCHAs
+
+If TikTok shows a CAPTCHA, the run stops and saves what it already collected
+(error code `CAPTCHA`). With `--show`, it waits up to 5 minutes so you can
+solve it yourself in the window, then carries on. It doesn't try to get past
+CAPTCHAs on its own; if they keep appearing, scrape less often or fewer pages.

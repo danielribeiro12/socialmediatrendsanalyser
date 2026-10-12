@@ -106,6 +106,16 @@ def find_page_info(kind, blobs):
 
 # ---------------------------------------------------------------- browser
 
+CAPTCHA_SELECTORS = (
+    "#captcha-verify-image", "#captcha_container", "[id*='captcha' i]",
+    "[class*='captcha' i]", "iframe[src*='captcha' i]",
+)
+CAPTCHA_TEXT = re.compile(r"verify to continue|drag the (slider|puzzle)|select \d+ objects", re.I)
+
+
+class CaptchaStop(Exception):
+    """TikTok showed a CAPTCHA: stop instead of hammering the site."""
+
 class Browser:
     def __init__(self, show):
         self.show = show
@@ -150,7 +160,37 @@ class Browser:
         self.reset()
         self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
         self.page.wait_for_timeout(random.randint(3000, 4500))
+        self.check_captcha()
         self.dismiss_popups()
+
+    def captcha_visible(self):
+        for sel in CAPTCHA_SELECTORS:
+            try:
+                if self.page.locator(sel).first.is_visible(timeout=300):
+                    return True
+            except Exception:
+                pass
+        try:
+            return self.page.get_by_text(CAPTCHA_TEXT).first.is_visible(timeout=300)
+        except Exception:
+            return False
+
+    def check_captcha(self, wait_s=300):
+        """If a CAPTCHA is up: with a visible window, give the person time to solve it
+        themselves; otherwise stop the run."""
+        if not self.captcha_visible():
+            return
+        if self.show:
+            log(f"  CAPTCHA on screen. Solve it in the browser window if you want the run to "
+                f"continue (waiting up to {wait_s // 60} min)...")
+            deadline = time.time() + wait_s
+            while time.time() < deadline:
+                self.page.wait_for_timeout(3000)
+                if not self.captcha_visible():
+                    log("  CAPTCHA cleared, continuing.")
+                    self.page.wait_for_timeout(2000)
+                    return
+        raise CaptchaStop()
 
     def page_data(self):
         """The data TikTok embeds in the page's HTML."""
@@ -194,6 +234,7 @@ class Browser:
             idle = idle + 1 if len(out) == before else 0
             self.page.mouse.wheel(0, random.randint(2500, 4000))
             self.page.wait_for_timeout(random.randint(1500, 3000))
+            self.check_captcha()
             self.dismiss_popups()
         return out
 
@@ -284,6 +325,8 @@ def scrape_explore(b, categories, max_items, records, errors):
                                         "browser; try again with --show."})
             records.extend(got)
             log(f"  {category}: {len(got)} videos")
+        except CaptchaStop:
+            raise
         except Exception as exc:
             errors.append({"category": category, "scraped_at": now(),
                            "errorCode": "SCRAPE_FAILED", "error": repr(exc)[:300]})
@@ -313,34 +356,41 @@ def scrape_page(b, kind, key, max_items, records, errors, pages):
                                     "wanted a login)."})
         count = info["video_count"] if info else None
         log(f"  {label}: {count if count is not None else '?'} total videos, {len(got)} sampled")
+    except CaptchaStop:
+        raise
     except Exception as exc:
         errors.append({"category": label, "scraped_at": now(), "errorCode": "SCRAPE_FAILED",
                        "error": repr(exc)[:300]})
-    time.sleep(random.uniform(1.5, 4))
+    time.sleep(random.uniform(5, 10))
 
 
 # ---------------------------------------------------------------- run
 
 def scrape(categories, max_items=50, show=False, data_dir="data", track=False,
-           track_items=15, watchlist="watchlist.txt", n_sounds=40, n_tags=20):
+           track_items=15, watchlist="watchlist.txt", n_sounds=20, n_tags=10):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     store = Store(data_dir)
     records, errors, pages = [], [], []
 
     with Browser(show) as b:
-        if categories:
-            log(f"Explore: {len(categories)} categories")
-            scrape_explore(b, categories, max_items, records, errors)
-            store.save(run_id, records, errors)  # so tracking can pick from this run too
+        try:
+            if categories:
+                log(f"Explore: {len(categories)} categories")
+                scrape_explore(b, categories, max_items, records, errors)
+                store.save(run_id, records, errors)  # so tracking can pick from this run too
 
-        if track:
-            sounds = pick_sounds(store.db, n_new=n_sounds, n_keep=n_sounds)
-            tags = pick_tags(store.db, load_watchlist(watchlist), n_new=n_tags, n_keep=n_tags)
-            log(f"Tracking: {len(tags)} hashtags, {len(sounds)} sounds")
-            for t in tags:
-                scrape_page(b, "tag", t, track_items, records, errors, pages)
-            for s in sounds:
-                scrape_page(b, "sound", s, track_items, records, errors, pages)
+            if track:
+                sounds = pick_sounds(store.db, n_new=n_sounds, n_keep=n_sounds)
+                tags = pick_tags(store.db, load_watchlist(watchlist), n_new=n_tags, n_keep=n_tags)
+                log(f"Tracking: {len(tags)} hashtags, {len(sounds)} sounds")
+                for t in tags:
+                    scrape_page(b, "tag", t, track_items, records, errors, pages)
+                for s in sounds:
+                    scrape_page(b, "sound", s, track_items, records, errors, pages)
+        except CaptchaStop:
+            errors.append({"category": "-", "scraped_at": now(), "errorCode": "CAPTCHA",
+                           "error": "TikTok asked for a CAPTCHA, so the run stopped early. "
+                                    "Everything collected before that was saved."})
 
     out = store.save(run_id, records, errors, pages)
     return run_id, records, errors, pages, out
@@ -355,8 +405,8 @@ def main():
     ap.add_argument("--track", action="store_true",
                     help="Also check hashtag and sound pages (watchlist + top recent ones)")
     ap.add_argument("--track-only", action="store_true", help="Only check hashtag/sound pages")
-    ap.add_argument("--sounds", type=int, default=40, help="New sounds to start tracking per run")
-    ap.add_argument("--tags", type=int, default=20, help="New hashtags to start tracking per run")
+    ap.add_argument("--sounds", type=int, default=20, help="New sounds to start tracking per run")
+    ap.add_argument("--tags", type=int, default=10, help="New hashtags to start tracking per run")
     ap.add_argument("--show", action="store_true", help="Show the browser window")
     ap.add_argument("--fallback-show", action="store_true",
                     help="If a hidden-browser run gets nothing, retry with the window shown")
@@ -380,7 +430,8 @@ def main():
             f"{len(errors)} errors -> {out}")
         for e in errors:
             log(f"  [{e['errorCode']}] {e['category']}: {e['error']}")
-        return records or pages
+        captcha = any(e["errorCode"] == "CAPTCHA" for e in errors)
+        return records or pages or captcha
 
     got = run(args.show)
     if not got and args.fallback_show and not args.show:
