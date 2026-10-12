@@ -20,7 +20,20 @@ a raw `data/runs/<run_id>.jsonl` export.
     python -m tiktok_explore.scraper --all                # every Explore category, 50 each
     python -m tiktok_explore.scraper "Comedy" "Singing & Dancing" --max-items 50
     python -m tiktok_explore.scraper --show               # watch the browser (use if results are empty)
-    python -m tiktok_explore.report                       # top hashtags and sounds from the latest run
+    python -m tiktok_explore.scraper --all --track        # + check hashtag and sound pages
+    python -m tiktok_explore.scraper --track-only         # only the hashtag/sound pages
+    python -m tiktok_explore.report                       # latest run + fastest-growing sounds/hashtags
+
+## Tracking hashtags and sounds
+
+With `--track`, each run also opens TikTok's page for a set of hashtags and
+sounds and records the total number of videos shown there. Comparing those
+totals between runs shows what's spreading. Pages checked each run:
+
+- every hashtag in `watchlist.txt` (edit it freely);
+- the 20 non-generic hashtags and 40 sounds used by the most different
+  creators in the last 3 days of Explore data;
+- anything first tracked in the last 7 days, so it keeps a continuous history.
 
 ## Scheduled runs (11:00 and 23:00 daily)
 
@@ -37,6 +50,6 @@ likes, shares, comments, author_id (only to de-duplicate), sound_id,
 sound_title, sound_author, sound_original, duration_s, is_ad.
 
 Failures are saved as error entries (`CATEGORY_NOT_FOUND`, `EXPLORE_EMPTY`,
-`SCRAPE_FAILED`) instead of being skipped.
+`PAGE_EMPTY`, `SCRAPE_FAILED`) instead of being skipped.
 
 Keep it gentle: logged out, a couple of runs a day.

@@ -1,20 +1,26 @@
-"""Logged-out TikTok Explore scraper.
+"""Logged-out TikTok scraper: Explore categories, plus hashtag and sound pages.
 
-Opens tiktok.com/explore in a real browser, clicks a category, scrolls, and
-captures the JSON the page itself loads (no request signing to reverse).
+Opens pages in a real browser and captures the JSON TikTok's own page loads
+(no request signing to reverse).
 """
 import argparse
+import json
 import random
 import re
+import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright
 
 from .parse import parse_item
 from .store import Store
+from .tracking import load_watchlist, pick_sounds, pick_tags
 
-EXPLORE_URL = "https://www.tiktok.com/explore"
+BASE = "https://www.tiktok.com"
+EXPLORE_URL = f"{BASE}/explore"
 
 ALL_CATEGORIES = [
     "All", "Singing & Dancing", "Comedy", "Sports", "Anime & Comics", "Relationship", "Shows",
@@ -22,13 +28,22 @@ ALL_CATEGORIES = [
     "Animals", "Family", "Drama", "Fitness & Health", "Education", "Technology",
 ]
 
+CATEGORY_SELECTOR = ("[class*='CategoryList'] button, [class*='CategoryItem'], "
+                     "[data-e2e*='category'] button, [role='tab']")
+
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- JSON helpers
+
 def find_items(obj):
-    """Find item lists anywhere in a JSON response (TikTok renames keys sometimes)."""
+    """Find a list of videos anywhere in a JSON blob (TikTok renames keys sometimes)."""
     if isinstance(obj, dict):
         for key in ("itemList", "item_list", "items"):
             val = obj.get(key)
@@ -46,20 +61,144 @@ def find_items(obj):
     return None
 
 
-def dismiss_popups(page):
-    page.keyboard.press("Escape")
-    for label in ("Decline optional cookies", "Decline all", "Not now", "Close"):
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), dict):
+            return obj[key]
+        for val in obj.values():
+            found = _find_key(val, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _find_key(val, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _num(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def find_page_info(kind, blobs):
+    """Pull the totals shown on a hashtag or sound page."""
+    key = "challengeInfo" if kind == "tag" else "musicInfo"
+    for blob in blobs:
+        info = _find_key(blob, key)
+        if not info:
+            continue
+        stats = {**(info.get("stats") or {}), **{k: v for k, v in (info.get("statsV2") or {}).items()
+                                                 if _num(v) is not None}}
+        if kind == "tag":
+            meta = info.get("challenge") or {}
+            title = meta.get("title")
+        else:
+            meta = info.get("music") or {}
+            title = " - ".join(x for x in (meta.get("title"), meta.get("authorName")) if x) or None
+        return {"title": title, "video_count": _num(stats.get("videoCount")),
+                "view_count": _num(stats.get("viewCount"))}
+    return None
+
+
+# ---------------------------------------------------------------- browser
+
+class Browser:
+    def __init__(self, show):
+        self.show = show
+        self.items, self.jsons = [], []
+
+    def __enter__(self):
+        self.pw = sync_playwright().start()
+        self.browser = self.pw.chromium.launch(headless=not self.show)
+        ctx = self.browser.new_context(
+            locale="en-US",
+            viewport={"width": 1280, "height": 900},
+            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+        )
+        self.page = ctx.new_page()
+        self.page.on("response", self._on_response)
+        return self
+
+    def __exit__(self, *exc):
+        self.browser.close()
+        self.pw.stop()
+
+    def _on_response(self, resp):
+        if "tiktok.com/api/" not in resp.url:
+            return
+        if "json" not in (resp.headers.get("content-type") or ""):
+            return
         try:
-            btn = page.get_by_role("button", name=label)
-            if btn.count():
-                btn.first.click(timeout=1500)
+            data = resp.json()
         except Exception:
-            pass
+            return
+        self.jsons.append(data)
+        items = find_items(data)
+        if items:
+            self.items.extend(items)
+
+    def reset(self):
+        self.items.clear()
+        self.jsons.clear()
+
+    def open(self, url):
+        self.reset()
+        self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        self.page.wait_for_timeout(random.randint(3000, 4500))
+        self.dismiss_popups()
+
+    def page_data(self):
+        """The data TikTok embeds in the page's HTML."""
+        try:
+            txt = self.page.evaluate("""() => {
+                for (const id of ['__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE']) {
+                    const el = document.getElementById(id);
+                    if (el) return el.textContent;
+                }
+                return null;
+            }""")
+            return json.loads(txt) if txt else None
+        except Exception:
+            return None
+
+    def dismiss_popups(self):
+        self.page.keyboard.press("Escape")
+        for label in ("Decline optional cookies", "Decline all", "Not now", "Close"):
+            try:
+                btn = self.page.get_by_role("button", name=label)
+                if btn.count():
+                    btn.first.click(timeout=1500)
+            except Exception:
+                pass
+
+    def collect(self, label, max_items, max_idle=6, seen=None):
+        """Scroll and gather videos until max_items or nothing new appears."""
+        seen = set() if seen is None else seen
+        out, idle = [], 0
+        while len(out) < max_items and idle < max_idle:
+            before = len(out)
+            while self.items and len(out) < max_items:
+                item = self.items.pop(0)
+                vid = str(item.get("id"))
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                out.append(parse_item(item, label, now()))
+            if len(out) >= max_items:
+                break
+            idle = idle + 1 if len(out) == before else 0
+            self.page.mouse.wheel(0, random.randint(2500, 4000))
+            self.page.wait_for_timeout(random.randint(1500, 3000))
+            self.dismiss_popups()
+        return out
 
 
-CATEGORY_SELECTOR = ("[class*='CategoryList'] button, [class*='CategoryItem'], "
-                     "[data-e2e*='category'] button, [role='tab']")
-
+# ---------------------------------------------------------------- explore
 
 def list_categories(page):
     names = []
@@ -76,6 +215,7 @@ def list_categories(page):
 def _try_click(el):
     """Click an element, falling back to force/JS clicks if a popup is in the way."""
     el.scroll_into_view_if_needed(timeout=2000)
+    last = None
     for attempt in ("normal", "force", "js"):
         try:
             if attempt == "normal":
@@ -121,113 +261,130 @@ def click_category(page, name):
     return reason
 
 
-def scrape(categories, max_items=100, show=False, data_dir="data", max_idle_scrolls=6):
+def scrape_explore(b, categories, max_items, records, errors):
+    for category in categories:
+        try:
+            b.open(EXPLORE_URL)
+            reason = click_category(b.page, category)
+            if reason:
+                avail = list_categories(b.page)
+                code = "CATEGORY_CLICK_FAILED" if category in avail else "CATEGORY_NOT_FOUND"
+                errors.append({"category": category, "scraped_at": now(), "errorCode": code,
+                               "error": f"Couldn't click '{category}' ({reason}). "
+                                        f"Seen on page: {avail}"})
+                continue
+            if category.lower() != "all":
+                b.items.clear()  # drop the default feed loaded before the click
+            b.page.wait_for_timeout(3000)
+            got = b.collect(category, max_items)
+            if not got:
+                errors.append({"category": category, "scraped_at": now(),
+                               "errorCode": "EXPLORE_EMPTY",
+                               "error": "No videos captured. TikTok may be blocking the "
+                                        "browser; try again with --show."})
+            records.extend(got)
+            log(f"  {category}: {len(got)} videos")
+        except Exception as exc:
+            errors.append({"category": category, "scraped_at": now(),
+                           "errorCode": "SCRAPE_FAILED", "error": repr(exc)[:300]})
+        time.sleep(random.uniform(2, 5))
+
+
+# ---------------------------------------------------------------- hashtag / sound pages
+
+def page_url(kind, key):
+    return f"{BASE}/tag/{quote(key)}" if kind == "tag" else f"{BASE}/music/sound-{key}"
+
+
+def scrape_page(b, kind, key, max_items, records, errors, pages):
+    label = f"{kind}:{key}"
+    try:
+        b.open(page_url(kind, key))
+        data = b.page_data()
+        b.items[:0] = find_items(data) or []
+        got = b.collect(label, max_items, max_idle=2)
+        info = find_page_info(kind, ([data] if data else []) + b.jsons)
+        if info:
+            pages.append({"scraped_at": now(), "kind": kind, "key": key, **info})
+        records.extend(got)
+        if not info and not got:
+            errors.append({"category": label, "scraped_at": now(), "errorCode": "PAGE_EMPTY",
+                           "error": "No totals or videos found (page missing, or TikTok "
+                                    "wanted a login)."})
+        count = info["video_count"] if info else None
+        log(f"  {label}: {count if count is not None else '?'} total videos, {len(got)} sampled")
+    except Exception as exc:
+        errors.append({"category": label, "scraped_at": now(), "errorCode": "SCRAPE_FAILED",
+                       "error": repr(exc)[:300]})
+    time.sleep(random.uniform(1.5, 4))
+
+
+# ---------------------------------------------------------------- run
+
+def scrape(categories, max_items=50, show=False, data_dir="data", track=False,
+           track_items=15, watchlist="watchlist.txt", n_sounds=40, n_tags=20):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     store = Store(data_dir)
-    records, errors = [], []
+    records, errors, pages = [], [], []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not show)
-        ctx = browser.new_context(
-            locale="en-US",
-            viewport={"width": 1280, "height": 900},
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
-        )
-        page = ctx.new_page()
-        captured = []
+    with Browser(show) as b:
+        if categories:
+            log(f"Explore: {len(categories)} categories")
+            scrape_explore(b, categories, max_items, records, errors)
+            store.save(run_id, records, errors)  # so tracking can pick from this run too
 
-        def on_response(resp):
-            if "tiktok.com/api/" not in resp.url:
-                return
-            if "json" not in (resp.headers.get("content-type") or ""):
-                return
-            try:
-                items = find_items(resp.json())
-            except Exception:
-                return
-            if items:
-                captured.extend(items)
+        if track:
+            sounds = pick_sounds(store.db, n_new=n_sounds, n_keep=n_sounds)
+            tags = pick_tags(store.db, load_watchlist(watchlist), n_new=n_tags, n_keep=n_tags)
+            log(f"Tracking: {len(tags)} hashtags, {len(sounds)} sounds")
+            for t in tags:
+                scrape_page(b, "tag", t, track_items, records, errors, pages)
+            for s in sounds:
+                scrape_page(b, "sound", s, track_items, records, errors, pages)
 
-        page.on("response", on_response)
-
-        for category in categories:
-            captured.clear()
-            seen, cat_records = set(), []
-            try:
-                page.goto(EXPLORE_URL, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(4000)
-                dismiss_popups(page)
-                reason = click_category(page, category)
-                if reason:
-                    avail = list_categories(page)
-                    code = "CATEGORY_CLICK_FAILED" if category in avail else "CATEGORY_NOT_FOUND"
-                    errors.append({"category": category, "scraped_at": now(), "errorCode": code,
-                                   "error": f"Couldn't click '{category}' ({reason}). "
-                                            f"Seen on page: {avail}"})
-                    continue
-                if category.lower() != "all":
-                    captured.clear()  # drop the default feed loaded before the click
-                page.wait_for_timeout(3000)
-
-                idle = 0
-                while len(cat_records) < max_items and idle < max_idle_scrolls:
-                    before = len(cat_records)
-                    while captured:
-                        item = captured.pop(0)
-                        vid = str(item.get("id"))
-                        if vid in seen:
-                            continue
-                        seen.add(vid)
-                        cat_records.append(parse_item(item, category, now()))
-                    idle = idle + 1 if len(cat_records) == before else 0
-                    page.mouse.wheel(0, random.randint(2500, 4000))
-                    page.wait_for_timeout(random.randint(1500, 3000))
-                    dismiss_popups(page)
-
-                if not cat_records:
-                    errors.append({"category": category, "scraped_at": now(),
-                                   "errorCode": "EXPLORE_EMPTY",
-                                   "error": "No videos captured. TikTok may be blocking the "
-                                            "browser; try again with --show."})
-                records.extend(cat_records[:max_items])
-                print(f"  {category}: {len(cat_records[:max_items])} videos", flush=True)
-            except Exception as exc:
-                errors.append({"category": category, "scraped_at": now(),
-                               "errorCode": "SCRAPE_FAILED", "error": repr(exc)})
-            time.sleep(random.uniform(2, 5))
-
-        browser.close()
-
-    out = store.save(run_id, records, errors)
-    return run_id, records, errors, out
+    out = store.save(run_id, records, errors, pages)
+    return run_id, records, errors, pages, out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Scrape TikTok Explore categories (logged out).")
+    ap = argparse.ArgumentParser(description="Scrape TikTok (logged out).")
     ap.add_argument("categories", nargs="*",
                     help='Explore categories, e.g. "Comedy" "Singing & Dancing". Default: All')
     ap.add_argument("--all", action="store_true", help="Scrape every Explore category")
     ap.add_argument("--max-items", type=int, default=50, help="Max videos per category")
+    ap.add_argument("--track", action="store_true",
+                    help="Also check hashtag and sound pages (watchlist + top recent ones)")
+    ap.add_argument("--track-only", action="store_true", help="Only check hashtag/sound pages")
+    ap.add_argument("--sounds", type=int, default=40, help="New sounds to start tracking per run")
+    ap.add_argument("--tags", type=int, default=20, help="New hashtags to start tracking per run")
     ap.add_argument("--show", action="store_true", help="Show the browser window")
     ap.add_argument("--fallback-show", action="store_true",
-                    help="If a hidden-browser run gets no videos, retry with the window shown")
+                    help="If a hidden-browser run gets nothing, retry with the window shown")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--watchlist", default="watchlist.txt")
     args = ap.parse_args()
-    categories = ALL_CATEGORIES if args.all else (args.categories or ["All"])
+
+    if args.track_only:
+        categories = []
+    else:
+        categories = ALL_CATEGORIES if args.all else (args.categories or ["All"])
+    track = args.track or args.track_only
 
     def run(show):
-        print(f"Scraping {len(categories)} categor{'y' if len(categories) == 1 else 'ies'}"
-              f"{' (browser visible)' if show else ''}...", flush=True)
-        run_id, records, errors, out = scrape(categories, args.max_items, show, args.data_dir)
-        print(f"Run {run_id}: {len(records)} videos, {len(errors)} errors -> {out}", flush=True)
+        if show:
+            log("(browser visible)")
+        run_id, records, errors, pages, out = scrape(
+            categories, args.max_items, show, args.data_dir, track,
+            watchlist=args.watchlist, n_sounds=args.sounds, n_tags=args.tags)
+        log(f"Run {run_id}: {len(records)} videos, {len(pages)} hashtag/sound totals, "
+            f"{len(errors)} errors -> {out}")
         for e in errors:
-            print(f"  [{e['errorCode']}] {e['category']}: {e['error']}", flush=True)
-        return records
+            log(f"  [{e['errorCode']}] {e['category']}: {e['error']}")
+        return records or pages
 
-    records = run(args.show)
-    if not records and args.fallback_show and not args.show:
-        print("No videos with the hidden browser; retrying with it visible.", flush=True)
+    got = run(args.show)
+    if not got and args.fallback_show and not args.show:
+        log("Nothing collected with the hidden browser; retrying with it visible.")
         run(True)
 
 

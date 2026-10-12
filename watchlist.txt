@@ -1,0 +1,9 @@
+# Hashtags checked on every tracking run (one per line, no #).
+# Their pages give a total video count we can watch grow over time.
+brainrot
+italianbrainrot
+brainrotmemes
+memes
+newmeme
+newtrend
+memetrend

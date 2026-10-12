@@ -59,3 +59,20 @@ def parse_item(item, category, scraped_at):
         "duration_s": _int(video.get("duration")),
         "is_ad": bool(item.get("isAd")),
     }
+
+
+# Tags people add to everything; they never signal a specific trend.
+GENERIC_TAGS = {
+    "fyp", "foryou", "foryoupage", "fy", "fypage", "viral", "viralvideo", "viraltiktok",
+    "trending", "trend", "goviral", "explore", "explorepage", "tiktok", "funny", "funnyvideos",
+    "comedy", "humor", "humour", "meme", "memes", "capcut", "xyzbca", "parati", "pourtoi",
+    "fürdich", "foryourpage", "4u", "4you", "relatable", "lol", "blowthisup", "duet", "stitch",
+    "greenscreen", "edit", "edits", "video", "viralvideos", "trendingvideo",
+    "creatorsearchinsights", "tiktokviral", "trendingnow", "foryourpage", "xuhuong",
+    "xuhuongtiktok", "keşfet", "keşfetteyiz", "рекомендации", "рек", "реки", "рекомендация",
+    "врек", "хочуврек", "глобальныерекомендации", "朝", "おすすめ", "おすすめにのりたい",
+}
+
+
+def is_generic(tag):
+    return tag in GENERIC_TAGS or tag.startswith("fyp") or tag.startswith("foryou")
